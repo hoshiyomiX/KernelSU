@@ -17,7 +17,7 @@ pub enum FeatureId {
     SuCompat = 0,
     KernelUmount = 1,
     EnhancedSecurity = 2,
-    AvcSpoof = 3,
+    AvcSpoof = 10003,
 }
 
 impl FeatureId {
@@ -26,7 +26,7 @@ impl FeatureId {
             0 => Some(FeatureId::SuCompat),
             1 => Some(FeatureId::KernelUmount),
             2 => Some(FeatureId::EnhancedSecurity),
-            3 => Some(FeatureId::AvcSpoof),
+            10003 => Some(FeatureId::AvcSpoof),
             _ => None,
         }
     }
@@ -63,7 +63,7 @@ fn parse_feature_id(name: &str) -> Result<FeatureId> {
         "su_compat" | "0" => Ok(FeatureId::SuCompat),
         "kernel_umount" | "1" => Ok(FeatureId::KernelUmount),
         "enhanced_security" | "2" => Ok(FeatureId::EnhancedSecurity),
-        "avc_spoof" | "3" => Ok(FeatureId::AvcSpoof),
+        "avc_spoof" | "10003" => Ok(FeatureId::AvcSpoof),
         _ => bail!("Unknown feature: {}", name),
     }
 }
