@@ -43,47 +43,94 @@ jobs:
       keystore_password: ${{ steps.gen.outputs.keystore_password }}
       key_password: ${{ steps.gen.outputs.key_password }}
     steps:
-      - name: Generate temporary keystore
-        if: github.event_name == 'pull_request'
+      - name: Resolve signing keystore
         id: gen
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
         run: |
-          KEYSTORE_PASSWORD=$(openssl rand -hex 32)
-          KEY_PASSWORD=$(openssl rand -hex 32)
-          echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
-          echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR builds cannot access repo secrets: ephemeral throwaway key.
+            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+            KEY_PASSWORD=$(openssl rand -hex 32)
+            echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+            echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
 
-          keytool -genkeypair \
-            -alias pr-key \
-            -keyalg RSA -keysize 2048 \
-            -validity 1 \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -dname "CN=KernelSU PR Build" \
-            -storetype JKS \
-            -keystore pr-key.jks
+            keytool -genkeypair \
+              -alias pr-key \
+              -keyalg RSA -keysize 2048 \
+              -validity 1 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=KernelSU PR Build" \
+              -storetype JKS \
+              -keystore pr-key.jks
 
-          echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+            echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+          elif [ -n "$PROD_KEYSTORE" ]; then
+            # Production keystore from repo secrets. It is only decoded in
+            # this job to extract the certificate below; the keystore itself
+            # is never exposed through job outputs.
+            echo "$PROD_KEYSTORE" | base64 -d > key.jks
+          else
+            # No secrets configured (e.g. forks): per-run CI key. Its
+            # certificate hash is forwarded to the LKM build below, so the
+            # manager APK and the kernel module built in this same run
+            # agree on the manager signature.
+            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+            echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+            echo "key_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+
+            keytool -genkeypair \
+              -alias ci-key \
+              -keyalg RSA -keysize 2048 \
+              -validity 10950 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEYSTORE_PASSWORD" \
+              -dname "CN=KoWSU CI Build" \
+              -storetype JKS \
+              -keystore ci-key.jks
+
+            echo "keystore=$(base64 -w 0 ci-key.jks)" >> $GITHUB_OUTPUT
+          fi
 
       - name: Extract certificate hash and size
-        if: github.event_name == 'pull_request'
         id: extract
         env:
-          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          EPHEMERAL_STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
         run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            KEYSTORE_FILE=pr-key.jks
+            KEY_ALIAS=pr-key
+            STORE_PASS="$EPHEMERAL_STORE_PASS"
+          elif [ -n "$PROD_KEYSTORE" ]; then
+            KEYSTORE_FILE=key.jks
+            KEY_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_KEYSTORE_PASSWORD"
+          else
+            KEYSTORE_FILE=ci-key.jks
+            KEY_ALIAS=ci-key
+            STORE_PASS="$EPHEMERAL_STORE_PASS"
+          fi
+
           # Export DER certificate
           keytool -exportcert \
-            -alias pr-key \
-            -keystore pr-key.jks \
+            -alias "$KEY_ALIAS" \
+            -keystore "$KEYSTORE_FILE" \
             -storepass "$STORE_PASS" \
-            -file pr-cert.der
+            -file cert.der
 
           # Calculate size in hex
-          SIZE_DEC=$(stat -c%s pr-cert.der)
+          SIZE_DEC=$(stat -c%s cert.der)
           SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
           echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
 
           # Calculate SHA256 hash
-          HASH=$(sha256sum pr-cert.der | awk '{print $1}')
+          HASH=$(sha256sum cert.der | awk '{print $1}')
           echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
 
           echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
@@ -152,6 +199,10 @@ jobs:
 
       - name: Write key
         if: ${{ github.event_name != 'pull_request' || github.ref_type == 'tag' }}
+        env:
+          CI_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
+          CI_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
+          CI_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
         run: |
           if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
             {
@@ -161,6 +212,17 @@ jobs:
               echo KEYSTORE_FILE='key.jks'
             } >> gradle.properties
             echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
+          else
+            # No release keystore configured: sign with the CI keystore
+            # resolved by generate-key so the gradle-built APK carries the
+            # same certificate the LKM of this run expects.
+            echo "$CI_KEYSTORE" | base64 -d > ci-key.jks
+            {
+              echo KEYSTORE_PASSWORD="$CI_KEYSTORE_PASSWORD"
+              echo KEY_ALIAS='ci-key'
+              echo KEY_PASSWORD="$CI_KEY_PASSWORD"
+              echo KEYSTORE_FILE='ci-key.jks'
+            } >> gradle.properties
           fi
 
       - name: Write PR key
@@ -280,6 +342,9 @@ jobs:
           PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CI_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
+          CI_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
+          CI_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
@@ -295,22 +360,14 @@ jobs:
             echo "SIGN_KEY_PASSWORD=$PROD_KEY_PASSWORD" >> $GITHUB_ENV
           else
             # No release keystore configured (e.g. forks without the
-            # KEYSTORE secret): generate a temporary one so the APK is
-            # still signed and installable.
-            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
-            keytool -genkeypair \
-              -alias ci-key \
-              -keyalg RSA -keysize 2048 \
-              -validity 30 \
-              -storepass "$KEYSTORE_PASSWORD" \
-              -keypass "$KEYSTORE_PASSWORD" \
-              -dname "CN=KoWSU CI Build" \
-              -storetype JKS \
-              -keystore ci-key.jks
+            # KEYSTORE secret): reuse the CI keystore resolved by
+            # generate-key so the APK is signed with the same certificate
+            # whose hash was compiled into the LKM (EXPECTED_SIZE2/HASH2).
+            echo "$CI_KEYSTORE" | base64 -d > ci-key.jks
             echo "SIGN_KEYSTORE_FILE=ci-key.jks" >> $GITHUB_ENV
             echo "SIGN_KEY_ALIAS=ci-key" >> $GITHUB_ENV
-            echo "SIGN_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
-            echo "SIGN_KEY_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "SIGN_KEYSTORE_PASSWORD=$CI_KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "SIGN_KEY_PASSWORD=$CI_KEY_PASSWORD" >> $GITHUB_ENV
           fi
 
       - name: Repack and resign

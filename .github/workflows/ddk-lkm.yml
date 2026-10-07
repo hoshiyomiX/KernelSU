@@ -13,12 +13,12 @@ on:
         default: '20260313'
         type: string
       expected_size2:
-        description: 'Second expected signature size (for PR builds)'
+        description: 'Second expected signature size (PR/CI key or release cert)'
         required: false
         default: ''
         type: string
       expected_hash2:
-        description: 'Second expected signature hash (for PR builds)'
+        description: 'Second expected signature hash (PR/CI key or release cert)'
         required: false
         default: ''
         type: string
