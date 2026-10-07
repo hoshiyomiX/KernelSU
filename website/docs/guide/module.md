@@ -375,7 +375,7 @@ Since the system is already fully running, certain boot-time mechanisms are unav
 | Magisk coexistence check | Yes | Skipped |
 | `post-fs-data` event reported to kernel | Yes | Skipped |
 | `boot-completed` event reported to kernel | Yes | Set directly during init |
-| `post-fs-data.sh` / `post-fs-data.d/` scripts | Yes | Replaced by `late-load` stage |
+| `post-fs-data.sh` / `post-fs-data.d/` scripts | Yes | Yes (runs before the `late-load` stage)
 | `system.prop` loading | Yes | Yes |
 | OverlayFS mount (metamodule) | Yes | Yes |
 | `post-mount.sh` / `post-mount.d/` scripts | Yes | Yes |
@@ -392,17 +392,18 @@ In late-load mode, the script execution order is:
 ksud late-load:
   1. Load kernelsu.ko (if not already loaded)
   2. Extract binaries, handle module updates, load SELinux rules, init features
-  3. Execute late-load.d/ and module late-load scripts (blocking)
-  4. Load system.prop (resetprop -n)
-  5. Execute metamodule mount script (OverlayFS)
-  6. Execute post-mount.d/ and module post-mount.sh (blocking)
-  7. Execute service.d/ and module service.sh (non-blocking)
-  8. Execute boot-completed.d/ and module boot-completed.sh (non-blocking)
+  3. Execute post-fs-data.d/, metamodule and module post-fs-data.sh scripts (blocking)
+  4. Execute late-load.d/ and module late-load scripts (blocking)
+  5. Load system.prop (resetprop -n)
+  6. Execute metamodule mount script (OverlayFS)
+  7. Execute post-mount.d/ and module post-mount.sh (blocking)
+  8. Execute service.d/ and module service.sh (non-blocking)
+  9. Execute boot-completed.d/ and module boot-completed.sh (non-blocking)
 ```
 
 ### Late-load specific scripts
 
-Modules can provide a `late-load.sh` script that runs **only** in late-load mode, as a replacement for `post-fs-data.sh`. This script runs before OverlayFS mounting, similar to `post-fs-data.sh` in the standard flow.
+Modules can provide a `late-load.sh` script that runs **only** in late-load mode. It runs after the `post-fs-data` stage and before OverlayFS mounting. Standard `post-fs-data.sh` scripts also run in late-load mode (after the system has fully booted), so modules written for the standard flow keep working; scripts that must behave differently in late-load mode can check the `KSU_LATE_LOAD` environment variable.
 
 Additionally, general scripts can be placed in `/data/adb/late-load.d/` to run during this stage.
 
