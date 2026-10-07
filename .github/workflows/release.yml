@@ -5,41 +5,90 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build-manager:
-    uses: ./.github/workflows/build-manager.yml
-    secrets: inherit
   release:
-    needs:
-      - build-manager
+    name: Build and release Manager APK
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
-
-      - name: Rename ksud
-        run: |
-          mkdir -p ksud
-          for dir in ./ksud-*; do
-              if [ -d "$dir" ]; then
-                 echo "----- Rename $dir -----"
-                 ksud_platform_name=$(basename "$dir")
-                 find "$dir" -type f -name "ksud" -path "*/release/*" | while read -r ksud_file; do
-                   if [ -f "$ksud_file" ]; then
-                     mv "$ksud_file" "ksud/$ksud_platform_name"
-                   fi
-                 done
-              fi
-          done
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - name: release
-        uses: softprops/action-gh-release@v2
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
-          files: |
-            manager/*.apk
-            android*-lkm/*_kernelsu.ko
-            ksud/ksud-*
-            ksuinit/**
+          fetch-depth: 0
+
+      - name: Write signing key
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ -n "$KEYSTORE" ]; then
+            {
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+              echo "KEYSTORE_FILE=key.jks"
+            } >> gradle.properties
+            echo "$KEYSTORE" | base64 -d > key.jks
+          else
+            # No release keystore configured (forks): generate a
+            # temporary one so the APK is always signed and installable.
+            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+            keytool -genkeypair \
+              -alias ci-key \
+              -keyalg RSA -keysize 2048 \
+              -validity 30 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEYSTORE_PASSWORD" \
+              -dname "CN=KoWSU CI Build" \
+              -storetype JKS \
+              -keystore ci-key.jks
+            {
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=ci-key"
+              echo "KEY_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEYSTORE_FILE=ci-key.jks"
+            } >> gradle.properties
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Build with Gradle
+        run: ./gradlew assembleRelease
+
+      - name: Upload APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(find app/build/outputs/apk/release -type f -name "*.apk" | head -n 1)
+          test -n "$APK"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="manager-$(git rev-parse --short HEAD)"
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Manager ${TAG}" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" "$APK" --clobber
+          gh release view "$TAG" --json assets -q '.assets[].name'
