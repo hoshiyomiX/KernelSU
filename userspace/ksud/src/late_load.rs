@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
-use rustix::cstr;
+use rustix::{cstr, process::chdir};
 use std::{process::Command, time::Instant};
 
 use crate::module::{ScriptWait, handle_updated_modules, prune_modules};
@@ -39,6 +39,23 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
     utils::daemonize(false)?;
     info!("late-load command triggered!");
     dump_process_info("late-load start");
+
+    // Enter init's mount namespace so the OverlayFS mounts performed by the
+    // metamodule mount script and the module stage scripts apply to the
+    // global mount namespace rather than the caller's one. In jailbreak
+    // (late-load) mode ksud is triggered from a root shell which may live
+    // in an app mount namespace (e.g. GhostLock); without this switch the
+    // module mounts would stay local to that namespace. Best effort: on
+    // failure keep the historical behaviour, the next soft reboot re-applies
+    // the mounts from the init namespace anyway.
+    if let Err(e) = utils::switch_mnt_ns(1) {
+        warn!("switch to init mount namespace failed: {e}");
+    } else {
+        info!("switched to init mount namespace");
+    }
+    if let Err(e) = chdir("/") {
+        warn!("chdir to / failed: {e}");
+    }
 
     // 1. Check if KernelSU is already loaded
     if ksuinit::has_kernelsu() {
@@ -108,30 +125,43 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
         warn!("init features failed: {e}");
     }
 
-    // 8. Execute late-load stage scripts with a shared boot deadline
+    // 8. Execute post-fs-data stage scripts (blocking, shared boot deadline)
+    // In late-load (jailbreak) mode the post-fs-data boot event has already
+    // passed when ksud starts, so module post-fs-data.sh scripts and
+    // /data/adb/post-fs-data.d/ scripts were never executed. Since every
+    // boot on a locked bootloader goes through the late-load path, standard
+    // KernelSU/Magisk modules relying on post-fs-data.sh were broken.
+    // Run the full post-fs-data stage (post-fs-data.d/, metamodule and
+    // module scripts), mirroring the ordering of on_post_fs_data() in the
+    // standard flow (before system.prop loading and OverlayFS mounting).
+    // Scripts can still distinguish the mode via the KSU_LATE_LOAD=1
+    // environment variable.
     let wait = ScriptWait::Until(Instant::now() + defs::BOOT_STAGE_TIMEOUT);
+    init_event::run_stage("post-fs-data", wait);
+
+    // 9. Execute late-load stage scripts using the same deadline
     init_event::run_stage("late-load", wait);
 
-    // 9. Load system.prop
+    // 10. Load system.prop
     if let Err(e) = crate::module::load_system_prop() {
         warn!("load system.prop failed: {e}");
     }
 
-    // 10. Execute metamodule mount script (OverlayFS)
+    // 11. Execute metamodule mount script (OverlayFS)
     if let Err(e) = metamodule::exec_mount_script(defs::MODULE_DIR) {
         warn!("execute metamodule mount failed: {e}");
     }
 
-    // 11. Execute post-mount stage scripts using the same deadline
+    // 12. Execute post-mount stage scripts using the same deadline
     init_event::run_stage("post-mount", wait);
 
-    // 12. Execute service stage scripts (non-blocking)
+    // 13. Execute service stage scripts (non-blocking)
     init_event::run_stage("service", ScriptWait::NoWait);
 
-    // 13. Execute boot-completed stage scripts (non-blocking)
+    // 14. Execute boot-completed stage scripts (non-blocking)
     init_event::run_stage("boot-completed", ScriptWait::NoWait);
 
-    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+    // 15. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
     info!("Restarting KernelSU Manager {package_name}...");
     let _ = Command::new("am")
         .args(["force-stop", package_name])
