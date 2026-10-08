@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
-use rustix::cstr;
+use rustix::{cstr, process::chdir};
 use std::{process::Command, time::Instant};
 
 use crate::module::{ScriptWait, handle_updated_modules, prune_modules};
@@ -39,6 +39,23 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
     utils::daemonize(false)?;
     info!("late-load command triggered!");
     dump_process_info("late-load start");
+
+    // Enter init's mount namespace so the OverlayFS mounts performed by the
+    // metamodule mount script and the module stage scripts apply to the
+    // global mount namespace rather than the caller's one. In jailbreak
+    // (late-load) mode ksud is triggered from a root shell which may live
+    // in an app mount namespace (e.g. GhostLock); without this switch the
+    // module mounts would stay local to that namespace. Best effort: on
+    // failure keep the historical behaviour, the next soft reboot re-applies
+    // the mounts from the init namespace anyway.
+    if let Err(e) = utils::switch_mnt_ns(1) {
+        warn!("switch to init mount namespace failed: {e}");
+    } else {
+        info!("switched to init mount namespace");
+    }
+    if let Err(e) = chdir("/") {
+        warn!("chdir to / failed: {e}");
+    }
 
     // 1. Check if KernelSU is already loaded
     if ksuinit::has_kernelsu() {
